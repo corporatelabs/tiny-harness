@@ -1,16 +1,19 @@
 import { runAgent } from "./agent.js";
-import { grade } from "./grader.js";
 import { phrases } from "./harness/phrases.js";
 import { DOMAIN_RULES } from "./harness/rules.js";
 import type { Model } from "./model.js";
+import { probeSignal, type ProbeScore } from "./probe.js";
 import type { Edit, Grade, Harness, Lesson, Reply, Task } from "./types.js";
 
 /**
  * Propose–Probe–Compose, plus a lesson library.
- * The composer keeps the probed candidate with the highest grader score.
+ * The composer keeps the candidate with the best proxy score.
  * A tie breaks toward fewer edits, so a neutral edit is not adopted.
- * The proposer never sees the grader.
+ * Reporting functions take an answer-key grader and call it only after selection.
  */
+
+/** Scores a finished reply against the hidden answer key. Selection must not call it. */
+export type AnswerKeyGrader = (task: Task, reply: Reply) => Grade;
 
 export interface Proposal {
   invariant: Edit;
@@ -82,7 +85,7 @@ export interface Probe {
   name: "reference" | "invariant" | "domain" | "merged";
   edits: Edit[];
   reply: Reply;
-  grade: Grade;
+  signal: ProbeScore;
 }
 
 const NAME_RANK: Record<Probe["name"], number> = {
@@ -92,10 +95,10 @@ const NAME_RANK: Record<Probe["name"], number> = {
   merged: 3,
 };
 
-/** Adopt the probe the grader supports. Fewer edits win a tie. */
+/** Adopt the candidate the proxy supports. Fewer edits win a tie. */
 export function chooseByProbeScore(probes: readonly Probe[]): Probe {
   const ranked = [...probes].sort((a, b) => {
-    if (a.grade.score !== b.grade.score) return b.grade.score - a.grade.score;
+    if (a.signal.score !== b.signal.score) return b.signal.score - a.signal.score;
     if (a.edits.length !== b.edits.length) return a.edits.length - b.edits.length;
     return NAME_RANK[a.name] - NAME_RANK[b.name];
   });
@@ -106,20 +109,13 @@ export function chooseByProbeScore(probes: readonly Probe[]): Probe {
 
 export async function probeEdits(
   model: Model,
-  task: Task,
+  lead: string,
   harness: Harness,
   proposal: Proposal,
-  reference?: { reply: Reply; grade: Grade },
+  reference?: Reply,
 ): Promise<Probe[]> {
-  const reply = reference?.reply ?? (await runAgent(model, harness, task.lead));
-  const probes: Probe[] = [
-    {
-      name: "reference",
-      edits: [],
-      reply,
-      grade: reference?.grade ?? grade(task, reply),
-    },
-  ];
+  const reply = reference ?? (await runAgent(model, harness, lead));
+  const probes: Probe[] = [scored("reference", [], reply, lead)];
   const candidates: { name: Probe["name"]; edits: Edit[] }[] = [
     { name: "invariant", edits: [proposal.invariant] },
   ];
@@ -129,15 +125,38 @@ export async function probeEdits(
   }
   for (const candidate of candidates) {
     const next = applyEdits(harness, candidate.edits);
-    const candidateReply = await runAgent(model, next, task.lead);
-    probes.push({
-      name: candidate.name,
-      edits: candidate.edits,
-      reply: candidateReply,
-      grade: grade(task, candidateReply),
-    });
+    const candidateReply = await runAgent(model, next, lead);
+    probes.push(scored(candidate.name, candidate.edits, candidateReply, lead));
   }
   return probes;
+}
+
+function scored(name: Probe["name"], edits: Edit[], reply: Reply, lead: string): Probe {
+  return { name, edits, reply, signal: probeSignal(lead, reply) };
+}
+
+export interface Selection {
+  proposal: Proposal;
+  probes: Probe[];
+  chosen: Probe;
+}
+
+/**
+ * Propose, probe, and compose for one lead.
+ * `gradeReply` is injected so a caller can spy on it. This function does not call it.
+ */
+export async function proposeProbeCompose(
+  model: Model,
+  lead: string,
+  harness: Harness,
+  library: Lesson[],
+  deps: { gradeReply: AnswerKeyGrader },
+): Promise<Selection> {
+  if (typeof deps.gradeReply !== "function") throw new Error("gradeReply must be a function");
+  const reply = await runAgent(model, harness, lead);
+  const proposal = proposeEdits(lead, reply, library);
+  const probes = await probeEdits(model, lead, harness, proposal, reply);
+  return { proposal, probes, chosen: chooseByProbeScore(probes) };
 }
 
 export interface TaskRun {
@@ -163,12 +182,17 @@ function finish(name: string, tasks: TaskRun[], lessons: string[]): ArmRun {
   return { name, tasks, mean, lessons };
 }
 
-/** One run of the base harness. No edits. */
-export async function runBaseline(model: Model, taskList: readonly Task[], harness: Harness): Promise<ArmRun> {
+/** One run of the base harness. No edits. `gradeReply` only reports the run. */
+export async function runBaseline(
+  model: Model,
+  taskList: readonly Task[],
+  harness: Harness,
+  gradeReply: AnswerKeyGrader,
+): Promise<ArmRun> {
   const tasks: TaskRun[] = [];
   for (const task of taskList) {
     const reply = await runAgent(model, harness, task.lead);
-    tasks.push({ id: task.id, score: grade(task, reply).score, adopted: [], probes: [] });
+    tasks.push({ id: task.id, score: gradeReply(task, reply).score, adopted: [], probes: [] });
   }
   return finish("baseline", tasks, []);
 }
@@ -177,7 +201,12 @@ export async function runBaseline(model: Model, taskList: readonly Task[], harne
  * Propose the same way, then adopt every edit without probing.
  * Lessons are not carried. This is the "edit without execution" arm.
  */
-export async function runBlind(model: Model, taskList: readonly Task[], harness: Harness): Promise<ArmRun> {
+export async function runBlind(
+  model: Model,
+  taskList: readonly Task[],
+  harness: Harness,
+  gradeReply: AnswerKeyGrader,
+): Promise<ArmRun> {
   const tasks: TaskRun[] = [];
   for (const task of taskList) {
     const reply = await runAgent(model, harness, task.lead);
@@ -187,7 +216,7 @@ export async function runBlind(model: Model, taskList: readonly Task[], harness:
     const finalReply = await runAgent(model, adopted, task.lead);
     tasks.push({
       id: task.id,
-      score: grade(task, finalReply).score,
+      score: gradeReply(task, finalReply).score,
       adopted: ruleIds(edits),
       probes: [],
     });
@@ -195,19 +224,18 @@ export async function runBlind(model: Model, taskList: readonly Task[], harness:
   return finish("no-probe", tasks, []);
 }
 
-/** Propose, probe the reference and each candidate, compose by probe score, keep lessons. */
-export async function runHarness2(model: Model, taskList: readonly Task[], harness: Harness): Promise<ArmRun> {
+/** Propose, probe, compose by proxy score, then report the chosen reply with the answer key. */
+export async function runHarness2(
+  model: Model,
+  taskList: readonly Task[],
+  harness: Harness,
+  gradeReply: AnswerKeyGrader,
+): Promise<ArmRun> {
   let library: Lesson[] = [];
   const tasks: TaskRun[] = [];
   for (const task of taskList) {
-    const reply = await runAgent(model, harness, task.lead);
-    const proposal = proposeEdits(task.lead, reply, library);
-    const probes = await probeEdits(model, task, harness, proposal, {
-      reply,
-      grade: grade(task, reply),
-    });
-    const chosen = chooseByProbeScore(probes);
-    for (const edit of chosen.edits) {
+    const selected = await proposeProbeCompose(model, task.lead, harness, library, { gradeReply });
+    for (const edit of selected.chosen.edits) {
       if (edit.scope !== "domain") continue;
       for (const rule of edit.rules) {
         if (!library.some((lesson) => lesson.id === rule.id)) library = [...library, toLesson(rule)];
@@ -215,11 +243,11 @@ export async function runHarness2(model: Model, taskList: readonly Task[], harne
     }
     tasks.push({
       id: task.id,
-      score: chosen.grade.score,
-      adopted: ruleIds(chosen.edits),
-      probes: probes.map((probe) => ({
+      score: gradeReply(task, selected.chosen.reply).score,
+      adopted: ruleIds(selected.chosen.edits),
+      probes: selected.probes.map((probe) => ({
         name: probe.name,
-        score: probe.grade.score,
+        score: probe.signal.score,
         rules: ruleIds(probe.edits),
       })),
     });

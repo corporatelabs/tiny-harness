@@ -1,13 +1,16 @@
 import { describe, expect, it } from "vitest";
+import { grade } from "../src/grader.js";
 import { baselineHarness } from "../src/harness/baseline.js";
 import { phrases } from "../src/harness/phrases.js";
 import {
   chooseByProbeScore,
   probeEdits,
   proposeEdits,
+  proposeProbeCompose,
   runBaseline,
   runBlind,
   runHarness2,
+  type AnswerKeyGrader,
   type Probe,
   type Proposal,
 } from "../src/loop.js";
@@ -26,7 +29,7 @@ function fake(name: Probe["name"], score: number, edits: Edit[]): Probe {
     name,
     edits,
     reply: { decision: "decline", items: [], total: null, notes: [] },
-    grade: { score, checks: [] },
+    signal: { score, checks: [] },
   };
 }
 
@@ -83,11 +86,13 @@ describe("probe", () => {
     const raw = await model.complete({ role: "executor", harness: baselineHarness, lead: task.lead });
     const reply = JSON.parse(raw) as Reply;
     const proposal = proposeEdits(task.lead, reply, []);
-    const probes = await probeEdits(model, task, baselineHarness, proposal);
+    const probes = await probeEdits(model, task.lead, baselineHarness, proposal);
     const reference = probes.find((probe) => probe.name === "reference");
     const domain = probes.find((probe) => probe.name === "domain");
-    expect(reference?.grade.score).toBe(33);
-    expect(domain?.grade.score).toBe(100);
+    expect(reference?.signal.score).toBe(90);
+    expect(domain?.signal.score).toBe(100);
+    expect(reference).toBeDefined();
+    expect(grade(task, reference?.reply as Reply).score).toBe(33);
   });
 });
 
@@ -119,11 +124,11 @@ describe("compose", () => {
       invariant: edit("invariant", "always-quote", phrases.alwaysQuote),
       domain: edit("domain", "seat-minimum", phrases.seatMinimum),
     };
-    const probes = await probeEdits(model, task, baselineHarness, proposal);
+    const probes = await probeEdits(model, task.lead, baselineHarness, proposal);
     const domain = probes.find((probe) => probe.name === "domain");
     const merged = probes.find((probe) => probe.name === "merged");
-    expect(domain?.grade.score).toBe(100);
-    expect(merged?.grade.score).toBeLessThan(100);
+    expect(domain?.signal.score).toBe(100);
+    expect(merged?.signal.score).toBeLessThan(domain?.signal.score ?? 0);
     expect(chooseByProbeScore(probes).name).toBe("domain");
   });
 });
@@ -132,41 +137,59 @@ describe("library and arms", () => {
   it("carries the seat-minimum lesson so the later Floor lead can also learn annual billing", async () => {
     const first = taskById("floor-too-small");
     const second = taskById("floor-four-monthly");
-    const harness2 = await runHarness2(model, [first, second], baselineHarness);
+    const harness2 = await runHarness2(model, [first, second], baselineHarness, grade);
     expect(harness2.tasks[0]?.score).toBe(100);
     expect(harness2.tasks[1]?.adopted).toEqual(["seat-minimum", "annual"]);
     expect(harness2.tasks[1]?.score).toBe(100);
     expect(harness2.lessons).toEqual(["seat-minimum", "annual"]);
 
-    const withoutLesson = await runHarness2(model, [second], baselineHarness);
+    const withoutLesson = await runHarness2(model, [second], baselineHarness, grade);
     expect(withoutLesson.tasks[0]?.score).toBe(80);
     expect(withoutLesson.tasks[0]?.adopted).toEqual(["seat-minimum"]);
 
-    const blind = await runBlind(model, [first, second], baselineHarness);
+    const blind = await runBlind(model, [first, second], baselineHarness, grade);
     expect(blind.tasks[1]?.score).toBe(80);
     expect(blind.lessons).toEqual([]);
   });
 
   it("adopts the coffee refusal's harmful edit only when nobody probes it", async () => {
     const task = taskById("coffee-machine");
-    const baseline = await runBaseline(model, [task], baselineHarness);
-    const blind = await runBlind(model, [task], baselineHarness);
-    const harness2 = await runHarness2(model, [task], baselineHarness);
+    const baseline = await runBaseline(model, [task], baselineHarness, grade);
+    const blind = await runBlind(model, [task], baselineHarness, grade);
+    const harness2 = await runHarness2(model, [task], baselineHarness, grade);
     expect(baseline.tasks[0]?.score).toBe(100);
     expect(blind.tasks[0]?.score).toBe(0);
     expect(blind.tasks[0]?.adopted).toEqual(["always-quote"]);
     expect(harness2.tasks[0]?.score).toBe(100);
     expect(harness2.tasks[0]?.adopted).toEqual([]);
     const invariant = harness2.tasks[0]?.probes.find((probe) => probe.name === "invariant");
-    expect(invariant?.score).toBe(0);
+    const reference = harness2.tasks[0]?.probes.find((probe) => probe.name === "reference");
+    expect(invariant?.score).toBeLessThan(reference?.score ?? 0);
+  });
+
+  it("does not call the injected answer-key grader during propose, probe, or compose", async () => {
+    const calls: string[] = [];
+    const spy: AnswerKeyGrader = (task, reply) => {
+      calls.push(task.id);
+      return grade(task, reply);
+    };
+    const lead = taskById("dozen-headsets").lead;
+    const selected = await proposeProbeCompose(model, lead, baselineHarness, [], { gradeReply: spy });
+    expect(calls).toEqual([]);
+    expect(selected.chosen.name).toBe("domain");
+
+    calls.length = 0;
+    const reported = await runHarness2(model, [taskById("dozen-headsets"), taskById("coffee-machine")], baselineHarness, spy);
+    expect(calls).toEqual(["dozen-headsets", "coffee-machine"]);
+    expect(reported.tasks).toHaveLength(2);
   });
 
   it("improves the fixed lead set from probe scores, and repeats exactly", async () => {
     const [baseline, blind, harness2, again] = await Promise.all([
-      runBaseline(model, tasks, baselineHarness),
-      runBlind(model, tasks, baselineHarness),
-      runHarness2(model, tasks, baselineHarness),
-      runHarness2(model, tasks, baselineHarness),
+      runBaseline(model, tasks, baselineHarness, grade),
+      runBlind(model, tasks, baselineHarness, grade),
+      runHarness2(model, tasks, baselineHarness, grade),
+      runHarness2(model, tasks, baselineHarness, grade),
     ]);
     expect(baseline.tasks.map((task) => task.score)).toEqual([100, 33, 33, 0, 100, 40, 25, 0, 0]);
     expect(blind.tasks.map((task) => task.score)).toEqual([100, 100, 100, 100, 0, 100, 100, 100, 80]);

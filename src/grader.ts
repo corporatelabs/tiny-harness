@@ -1,8 +1,8 @@
 import type { Grade, LineItem, Reply, Task } from "./types.js";
 
 /**
- * Deterministic partial-credit grader.
- * The executor and the proposer never call this. The composer does, as the probe.
+ * Hidden answer key. Arms call this only to report a finished reply.
+ * Propose, probe, and compose do not.
  */
 export function grade(task: Task, reply: Reply): Grade {
   const notes = reply.notes.join(" ").toLowerCase();

@@ -1,7 +1,11 @@
 import { pathToFileURL } from "node:url";
+import { runAgent } from "./agent.js";
+import { grade } from "./grader.js";
 import { baselineHarness } from "./harness/baseline.js";
-import { runBaseline, runBlind, runHarness2, type ArmRun, type TaskRun } from "./loop.js";
+import { phrases } from "./harness/phrases.js";
+import { applyEdits, runBaseline, runBlind, runHarness2, type ArmRun, type TaskRun } from "./loop.js";
 import { ScriptedModel } from "./model.js";
+import { probeSignal } from "./probe.js";
 import { tasks } from "./tasks/tasks.js";
 
 /**
@@ -11,9 +15,9 @@ import { tasks } from "./tasks/tasks.js";
 export async function main(): Promise<void> {
   const model = new ScriptedModel();
   const [baseline, blind, harness2] = await Promise.all([
-    runBaseline(model, tasks, baselineHarness),
-    runBlind(model, tasks, baselineHarness),
-    runHarness2(model, tasks, baselineHarness),
+    runBaseline(model, tasks, baselineHarness, grade),
+    runBlind(model, tasks, baselineHarness, grade),
+    runHarness2(model, tasks, baselineHarness, grade),
   ]);
 
   console.log("Tiny Harness");
@@ -21,13 +25,18 @@ export async function main(): Promise<void> {
   console.log("Deterministic stand-in model. It follows phrases written in the harness.");
   console.log("These scores illustrate Propose–Probe–Compose. They are not a benchmark.");
   console.log("");
+  console.log("Answer-key scores. The loop does not see this grader.");
   console.log(table(baseline, blind, harness2));
   console.log("");
   console.log(regressions(baseline, blind));
   console.log("");
+  console.log(proxyGaps(baseline, harness2));
+  console.log("");
+  console.log(await noteGap(model));
+  console.log("");
   console.log(`Lessons carried by Harness²: ${harness2.lessons.join(", ") || "(none)"}`);
   console.log("");
-  console.log("Probe traces (Harness²). The chosen row is the one with the best probe score.");
+  console.log("Probe traces (proxy only: catalog, arithmetic, and the lead's own constraints).");
   for (const task of harness2.tasks) {
     console.log("");
     console.log(task.id);
@@ -69,6 +78,31 @@ function regressions(baseline: ArmRun, blind: ArmRun): string {
   }
   if (rows.length === 0) return "No-probe regressions: none";
   return ["No-probe regressions:", ...rows].join("\n");
+}
+
+function proxyGaps(baseline: ArmRun, harness2: ArmRun): string {
+  const rows: string[] = [];
+  for (let i = 0; i < baseline.tasks.length; i += 1) {
+    const base = baseline.tasks[i];
+    const improved = harness2.tasks[i];
+    const reference = improved?.probes.find((probe) => probe.name === "reference");
+    if (!base || !reference || reference.score === base.score) continue;
+    rows.push(`  ${base.id}  answer key ${base.score}, proxy ${reference.score}`);
+  }
+  if (rows.length === 0) return "Baseline rows where the proxy and the answer key differ: none";
+  return ["Baseline rows where the proxy and the answer key differ:", ...rows].join("\n");
+}
+
+async function noteGap(model: ScriptedModel): Promise<string> {
+  const task = tasks.find((item) => item.id === "floor-four-monthly");
+  if (!task) return "Proxy gap example: floor-four-monthly is missing";
+  const harness = applyEdits(baselineHarness, [
+    { scope: "domain", rules: [{ id: "seat-minimum", text: phrases.seatMinimum, keywords: ["floor"] }] },
+  ]);
+  const reply = await runAgent(model, harness, task.lead);
+  const proxy = probeSignal(task.lead, reply).score;
+  const hidden = grade(task, reply).score;
+  return `Seat-only Floor refusal on floor-four-monthly: proxy ${proxy}, answer key ${hidden}.`;
 }
 
 function sameChoice(task: TaskRun, probe: { name: string; rules: string[] }): boolean {
