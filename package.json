@@ -1,0 +1,22 @@
+{
+  "name": "tiny-harness",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A small, deterministic sales-agent demo of the Harness² propose–probe–compose loop.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "demo": "tsx src/demo.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.19.0",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vitest": "^5.1.1"
+  }
+}
