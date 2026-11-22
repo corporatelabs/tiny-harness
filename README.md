@@ -1,5 +1,7 @@
 # Tiny Harness
 
+![Tiny Harness](docs/assets/hero.png)
+
 A small TypeScript sales agent that qualifies an inbound lead and drafts a quote from a five-product catalog. The model is frozen. What changes is the harness around it: a system prompt, guardrails, and skill notes.
 
 The loop is a minimal demo of [Harness²](https://arxiv.org/abs/2610.14224) (Xu et al., arXiv:2610.14224). For each lead it runs the current harness once, proposes an invariant edit and a domain edit, probes each candidate on that same lead, and keeps an edit only when the probe score supports it. A lesson library carries adopted domain rules to later leads.
